@@ -305,3 +305,9 @@ def test_directory_mode_all_valid_exits_zero(tmp_path):
     )
     result = run_validator(str(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_custodian_catalog_uses_buildable_upstream_commit():
+    """The earlier pin used a nonexistent setuptools.backends build backend."""
+    entry = yaml.safe_load((REPO_ROOT / "plugin-catalog" / "custodian.yaml").read_text())
+    assert entry["sha"] == "d5b4ebfd2353a29380a51c8bcba84d4682cf4c91"
