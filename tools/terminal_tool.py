@@ -1179,7 +1179,7 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
+def _acquire_env(plan: _ExecPlan, task_id: Optional[str], *, existing_only: bool = False) -> Any:
     """Cached env for the task, else create it under the per-task creation lock.
 
     Concurrent calls for the same task_id wait for the first sandbox instead
@@ -1194,6 +1194,8 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
         env: Any = _lookup_active_env(eff, task_id)
     if env is not None:
         return env
+    if existing_only:
+        raise _Rejected(_error_json("No active terminal environment for this session"))
 
     with _creation_locks_lock:
         task_lock = _creation_locks.setdefault(eff, threading.Lock())
@@ -1379,6 +1381,7 @@ def terminal_tool(
     _completion_output_chars: int = 0,
     heartbeat: int = 0,
     persist_on_release: bool = False,
+    _existing_only: bool = False,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1398,6 +1401,8 @@ def terminal_tool(
     process_manage kill (#41225).
     ``_completion_output_chars`` (internal) sizes the completion notification's output for a
     spawner whose output is the payload (a bot DM's reply); 0 keeps the usual tail.
+    ``_existing_only`` (internal) refuses a cold environment instead of provisioning one
+    for advisory directory completion.
     ``_host_local`` forces the local backend for Hermes-owned control-plane
     children (kept in a separate env cache from the configured backend).
     """
@@ -1407,7 +1412,8 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
-        env = _acquire_env(plan, task_id)
+        env = (_acquire_env(plan, task_id, existing_only=True) if _existing_only
+               else _acquire_env(plan, task_id))
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker

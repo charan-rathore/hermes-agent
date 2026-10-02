@@ -176,7 +176,7 @@ def _backend_dir_entries(search_dir: str, session_key: str | None) -> list[tuple
         with unmetered_backend_calls():  # Hermes' own listing, not the user's backend work
             result = json.loads(terminal_tool(
                 f"sh -c {shlex.quote(script)} sh {shlex.quote(search_dir)}", task_id=session_key, timeout=3,
-                force=True))
+                force=True, _existing_only=True))
     except Exception:
         return []
     if result.get("error") or result.get("exit_code") not in (0, None):
@@ -233,6 +233,21 @@ def _dir_listing_items(root: str, word: str, path_part: str, prefix_tag: str, is
 @method("complete.path")
 @_catch(5021)
 def _(rid, params: dict) -> dict:
+    session = _sessions.get(params.get("session_id", ""))
+    if params.get("session_id") and session is None:
+        return _ok(rid, {"items": []})
+    profile_home = session.get("profile_home") if session else None
+    if not session and params.get("profile"):
+        profile_home = str(_profile_home(params["profile"]) or "") or None
+    with _session_profile_runtime_scope({"profile_home": profile_home}, hydrate_secrets=False):
+        tokens = _set_session_context(session.get("session_key", "") if session else "", cwd=params.get("cwd"))
+        try:
+            return _complete_path(rid, params)
+        finally:
+            _clear_session_context(tokens)
+
+
+def _complete_path(rid, params: dict) -> dict:
     word = params.get("word", "")
     if not word:
         return _ok(rid, {"items": []})
