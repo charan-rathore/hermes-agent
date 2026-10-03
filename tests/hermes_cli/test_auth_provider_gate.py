@@ -327,3 +327,33 @@ def test_aws_env_does_not_leak_into_other_providers(tmp_path, monkeypatch, _clea
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("anthropic") is False
+
+
+@pytest.mark.parametrize("fallback", [
+    {"fallback_providers": [{"provider": "xai-oauth", "model": "grok"}, {"provider": "anthropic", "model": "claude-opus-4-8"}]},
+    {"fallback_model": {"provider": "anthropic", "model": "claude-opus-4-8"}},
+    {"fallback_model": [{"provider": "Anthropic", "model": "claude-opus-4-8"}]},
+])
+def test_fallback_chain_provider_counts_as_explicit(tmp_path, monkeypatch, fallback):
+    """A provider named in fallback_providers / fallback_model is an explicit selection, so the
+    borrowed claude_code row is seeded instead of left token-less and skipped as 'exhausted'."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_config(tmp_path, {"model": {"provider": "openai-codex", "default": "gpt-5.5"}, **fallback})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": "openai-codex"})
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("anthropic") is True
+
+
+@pytest.mark.parametrize("fallback", [
+    {"fallback_providers": [{"provider": "xai-oauth", "model": "grok"}]},
+    {"fallback_providers": "anthropic"},
+    {"fallback_providers": [None, "anthropic"]},
+])
+def test_fallback_chain_other_or_malformed_does_not_count(tmp_path, monkeypatch, fallback):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_config(tmp_path, {"model": {"provider": "openai-codex", "default": "gpt-5.5"}, **fallback})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": "openai-codex"})
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("anthropic") is False

@@ -1251,6 +1251,15 @@ def _config_selects_provider(normalized: str) -> bool:
             any(_slot_selects(s, normalized) for s in block.get("reference_models") or [])
             or _slot_selects(block.get("aggregator"), normalized))
 
+    # Naming a provider in ``fallback_providers`` (or legacy ``fallback_model``) is the same consent
+    # as ``model.provider``: without it the borrowed claude_code row is never filled in and the
+    # fallback chain skips the provider as "credential pool exhausted".
+    for key in ("fallback_providers", "fallback_model"):
+        chain = cfg.get(key)
+        chain = [chain] if isinstance(chain, dict) else chain
+        if isinstance(chain, (list, tuple)) and any(_slot_selects(s, normalized) for s in chain):
+            return True
+
     moa_cfg = cfg.get("moa")
     if not isinstance(moa_cfg, dict):
         return False
