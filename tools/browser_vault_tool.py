@@ -193,10 +193,27 @@ def _current_page_origin(task_id: str) -> Optional[str]:
 
 # Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
 _TAB_PROBES = {
-    "login": "!!document.querySelector('input[type=password]')",
+    # A login page usually has input[type=password], but some sites mask the box in CSS and keep it
+    # type=text: also match the autocomplete tokens, a password-named field, and computed-style masking
+    # (-webkit-text-security or a text-security font), so such a page still wins the tab search (#135451).
+    "login": ("!!document.querySelector('input[type=password], input[autocomplete=current-password], "
+              "input[autocomplete=new-password], input[id*=password i], input[name*=password i], "
+              "input[placeholder*=password i]')"
+              " || [...document.querySelectorAll('input')].some(i => { const s = getComputedStyle(i);"
+              " return (s.webkitTextSecurity && s.webkitTextSecurity !== 'none')"
+              " || /text-security/i.test(s.fontFamily || ''); })"),
     "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]')",
     "address": "!!document.querySelector('input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]')",
 }
+
+
+def _current_page_has(task_id: str, probe: str) -> bool:
+    """True when ``probe`` (a boolean JS expression) is truthy on the CURRENT page. The result arrives as a
+    boolean or its string form depending on the eval path, so compare the normalized text."""
+    res = _eval_js(task_id, probe)
+    if not res.get("success"):
+        return False
+    return str(res.get("result")).strip().strip('"').strip("'").lower() == "true"
 
 
 def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
@@ -296,8 +313,12 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
-    # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
+    # the daemon's blank tab). When the current page already holds the login form, keep it: an any-origin
+    # search matches the FIRST tab with a password field, which may be an unrelated site, and the save
+    # would bind to that origin (#135451). Only when the current page has no login form, look for the tab
+    # holding one.
+    if not _current_page_has(effective_task_id, _TAB_PROBES["login"]):
+        _focus_bound_origin(effective_task_id, "", "login")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})

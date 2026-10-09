@@ -683,6 +683,74 @@ class TestSaveLoginPrompt:
         [meta] = store.list_items()
         assert meta.origin == "https://acme.test" and meta.identifier == "tek@acme.test"
 
+    def test_prefers_the_current_page_when_it_holds_the_login_form(self, store, monkeypatch):
+        """The any-origin tab search must not hijack the save when the current page already holds the
+        login form: a first-match search would otherwise bind the credential to an unrelated open login
+        tab's origin (#135451)."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        searches = []
+
+        def fake_eval(task_id, expr):
+            if expr == browser_vault_tool._TAB_PROBES["login"]:
+                return {"success": True, "result": True}  # the current page holds the login form
+            return {"success": True, "result": "https://acme.test/login"}
+
+        monkeypatch.setattr(browser_vault_tool, "_eval_js", fake_eval)
+        monkeypatch.setattr(browser_vault_tool, "_focus_bound_origin",
+                            lambda *a, **k: searches.append(a) or None)
+        monkeypatch.setattr(browser_vault_tool, "browser_vault_fill",
+                            lambda handle, task_id=None: json.dumps({"success": True, "filled_fields": 1}))
+        unlock_mod.set_save_login_prompt_callback(lambda origin, site: {"identifier": "tek", "password": "pw"})
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
+            out = json.loads(browser_vault_tool.browser_vault_save_login(task_id="t1"))
+        unlock_mod.set_save_login_prompt_callback(None)
+
+        assert out["success"] is True
+        assert searches == []  # no tab search: the current page already holds the form
+        [meta] = store.list_items()
+        assert meta.origin == "https://acme.test"
+
+    def test_falls_back_to_the_tab_search_when_the_current_page_has_no_login_form(self, store, monkeypatch):
+        """Without a login form on the current page the tool still searches the other tabs, so a save from
+        a non-form page behaves as before (#135451)."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        searches = []
+
+        def fake_eval(task_id, expr):
+            if expr == browser_vault_tool._TAB_PROBES["login"]:
+                return {"success": True, "result": False}  # no login form on the current page
+            return {"success": True, "result": "https://acme.test/login"}
+
+        monkeypatch.setattr(browser_vault_tool, "_eval_js", fake_eval)
+        monkeypatch.setattr(browser_vault_tool, "_focus_bound_origin",
+                            lambda *a, **k: searches.append(a) or None)
+        monkeypatch.setattr(browser_vault_tool, "browser_vault_fill",
+                            lambda handle, task_id=None: json.dumps({"success": True, "filled_fields": 1}))
+        unlock_mod.set_save_login_prompt_callback(lambda origin, site: {"identifier": "tek", "password": "pw"})
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
+            out = json.loads(browser_vault_tool.browser_vault_save_login(task_id="t1"))
+        unlock_mod.set_save_login_prompt_callback(None)
+
+        assert out["success"] is True
+        assert len(searches) == 1
+
+    def test_login_probe_covers_masked_and_autocomplete_password_boxes(self):
+        """A password box masked in CSS (kept type=text) still marks its tab as the login tab: the probe
+        reads autocomplete tokens, password-named fields and computed-style masking, not only
+        type=password (#135451)."""
+        from tools import browser_vault_tool
+
+        probe = browser_vault_tool._TAB_PROBES["login"]
+        assert "input[type=password]" in probe
+        assert "autocomplete=current-password" in probe
+        assert "webkitTextSecurity" in probe
+
     def test_declined_or_headless_stores_nothing(self, store, monkeypatch):
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
