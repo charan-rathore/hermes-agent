@@ -382,6 +382,97 @@ async def test_disconnect_cancels_running_bot_task(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_disconnect_bounds_a_bot_task_that_ignores_cancellation(monkeypatch):
+    """A stuck Discord handshake must not hold the gateway reconnect watcher forever."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    task_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    client_closed = asyncio.Event()
+
+    async def cancellation_resistant_start():
+        task_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await client_closed.wait()
+
+    bot_task = asyncio.create_task(cancellation_resistant_start())
+    adapter._bot_task = bot_task
+    adapter._client = SimpleNamespace(
+        close=AsyncMock(side_effect=client_closed.set),
+        ws=None,
+    )
+    adapter._voice_clients = {}
+    adapter._running = True
+    adapter._ready_event = asyncio.Event()
+    await task_started.wait()
+    monkeypatch.setattr(
+        discord_platform,
+        "_DISCORD_BOT_TASK_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    closing = asyncio.create_task(adapter.disconnect())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=0.1)
+    finally:
+        client_closed.set()
+        if not bot_task.done():
+            bot_task.cancel()
+        await asyncio.gather(closing, bot_task, return_exceptions=True)
+
+    assert closing in done
+    assert cancellation_seen.is_set()
+    assert bot_task.done()
+    assert adapter._client is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_aborts_transport_when_client_close_hangs(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(
+        discord_platform,
+        "_DISCORD_CLIENT_CLOSE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    transport = SimpleNamespace(abort=MagicMock())
+    adapter._client = SimpleNamespace(
+        close=AsyncMock(side_effect=asyncio.Event().wait),
+        ws=SimpleNamespace(
+            socket=SimpleNamespace(
+                _writer=SimpleNamespace(transport=transport),
+            ),
+        ),
+    )
+    adapter._voice_clients = {}
+
+    closing = asyncio.create_task(adapter.disconnect())
+    done, _ = await asyncio.wait({closing}, timeout=0.1)
+    if closing not in done:
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        pytest.fail("Discord disconnect did not finish within the test budget")
+    await closing
+
+    assert closing in done
+    transport.abort.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_discarded_discord_adapter_drops_late_inbound_messages():
+    """A retiring client must not dispatch events after registry ownership is removed."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._client = SimpleNamespace(user=object())
+    adapter._running = True
+    adapter._disconnecting = True
+    adapter._ready_event.set()
+
+    assert await adapter._dispatch_discord_message(object()) is False
+
+
+@pytest.mark.asyncio
 async def test_safe_sync_slash_commands_only_mutates_diffs():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 

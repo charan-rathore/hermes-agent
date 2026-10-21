@@ -86,6 +86,8 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_BOT_TASK_CANCEL_TIMEOUT_SECONDS = 1.0
+_DISCORD_CLIENT_CLOSE_TIMEOUT_SECONDS = 1.0
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -377,6 +379,51 @@ def _abort_discord_websocket_transport(websocket: Any) -> bool:
         return False
     abort()
     return True
+
+
+async def _close_discord_client_bounded(client: Any, name: str) -> bool:
+    """Close a Discord client within a fixed budget, aborting a stuck WebSocket close."""
+    websocket = getattr(client, "ws", None)
+    close_task = asyncio.create_task(client.close())
+    done, _pending = await asyncio.wait(
+        {close_task}, timeout=_DISCORD_CLIENT_CLOSE_TIMEOUT_SECONDS,
+    )
+    if close_task in done:
+        try:
+            await close_task
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("[%s] Error during Discord client close", name, exc_info=True)
+            return False
+
+    logger.warning("[%s] Timed out closing Discord client", name)
+    close_task.cancel()
+    close_task.add_done_callback(_consume_background_task_result)
+    closing_task = getattr(client, "_closing_task", None)
+    if isinstance(closing_task, asyncio.Task):
+        closing_task.cancel()
+        closing_task.add_done_callback(_consume_background_task_result)
+        # discord.py caches this task; let a later close retry instead of awaiting the same hang.
+        client._closing_task = None
+    try:
+        if _abort_discord_websocket_transport(websocket):
+            logger.warning("[%s] Aborted unresponsive Discord WebSocket transport", name)
+    except Exception:
+        logger.debug("[%s] Error aborting Discord WebSocket transport", name, exc_info=True)
+    return False
+
+
+def _disable_discord_client_events(client: Any) -> None:
+    """Stop an abandoned client from dispatching into an adapter the gateway has retired."""
+    for name in tuple(vars(client)):
+        if name.startswith("on_"):
+            setattr(client, name, None)
+    extra_events = getattr(client, "extra_events", None)
+    if isinstance(extra_events, dict):
+        for listeners in extra_events.values():
+            listeners.clear()
 
 
 async def _wait_for_ready_or_bot_exit(
@@ -1751,6 +1798,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
+        if self._disconnecting or not self._running or self._client is None:
+            return False
         if not self._ready_event.is_set():
             try:
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
@@ -1908,15 +1957,46 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             })
         await self._emit_platform_event("thread_renamed", _build)
 
-    async def _cancel_bot_task(self) -> None:
-        """Cancel and await the background client.start() task, if running."""
-        if self._bot_task and not self._bot_task.done():
-            self._bot_task.cancel()
-            try:
-                await self._bot_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._bot_task = None
+    async def _cancel_bot_task(self) -> bool:
+        """Cancel the background client task without waiting indefinitely for its WebSocket."""
+        self._disconnecting = True
+        self._running = False
+        task = self._bot_task
+        if task is None:
+            return False
+        if not task.done():
+            task.cancel()
+            done, _pending = await asyncio.wait(
+                {task}, timeout=_DISCORD_BOT_TASK_CANCEL_TIMEOUT_SECONDS,
+            )
+            if task not in done:
+                logger.warning(
+                    "[%s] Discord client task did not stop after cancellation; closing its client",
+                    self.name,
+                )
+                client = self._client
+                if client is not None:
+                    await _close_discord_client_bounded(client, self.name)
+                if not task.done():
+                    task.cancel()
+                    done, _pending = await asyncio.wait(
+                        {task}, timeout=_DISCORD_BOT_TASK_CANCEL_TIMEOUT_SECONDS,
+                    )
+                if task not in done:
+                    if client is not None:
+                        _disable_discord_client_events(client)
+                    logger.error(
+                        "[%s] Discord client task remains active after transport shutdown",
+                        self.name,
+                    )
+                    return client is not None
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        if self._bot_task is task:
+            self._bot_task = None
+        return False
 
     def _start_liveness_probe(self) -> None:
         """Start the periodic Gateway WS health probe (REST success doesn't prove event delivery)."""
@@ -2050,36 +2130,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     async def _notify_liveness_fatal_error(self, client: Any) -> None:
         """Close the failed client, then notify the runner outside the sampler (which must not
         await itself via ``disconnect()``); the runner owns the bounded teardown."""
-        failed_websocket = getattr(client, "ws", None)
         try:
-            close_task = asyncio.create_task(client.close())
-            try:
-                done, _pending = await asyncio.wait({close_task}, timeout=1.0)
-                if close_task not in done:
-                    raise TimeoutError
-                await close_task
-            except TimeoutError:
-                logger.warning("[%s] Timed out closing unhealthy Discord client", self.name)
-                close_task.cancel()
-                close_task.add_done_callback(_consume_background_task_result)
-                closing_task = getattr(client, "_closing_task", None)
-                if isinstance(closing_task, asyncio.Task):
-                    closing_task.cancel()
-                    closing_task.add_done_callback(_consume_background_task_result)
-                    # Client.close() caches this task; clear it before the runner's disconnect retries.
-                    client._closing_task = None
-                try:
-                    if _abort_discord_websocket_transport(failed_websocket):
-                        logger.warning(
-                            "[%s] Aborted unresponsive Discord WebSocket transport", self.name,
-                        )
-                except Exception:
-                    logger.debug(
-                        "[%s] Error aborting unhealthy Discord WebSocket transport", self.name,
-                        exc_info=True,
-                    )
-            except Exception:
-                logger.debug("[%s] Error closing unhealthy Discord client", self.name, exc_info=True)
+            await _close_discord_client_bounded(client, self.name)
             # Runner may run disconnect() elsewhere; drop the self-ref so it can't cancel this callback.
             if self._liveness_notification_task is asyncio.current_task():
                 self._liveness_notification_task = None
@@ -2163,12 +2215,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
         # Cancel the bot task before closing: after a connect() timeout client.start() may still run
         # and discord.py's reconnect loop can ignore the closed flag mid-handshake.
-        await self._cancel_bot_task()
-        if self._client:
-            try:
-                await self._client.close()
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
+        client_closed = await self._cancel_bot_task()
+        if self._client and not client_closed:
+            await _close_discord_client_bounded(self._client, self.name)
         for task in (self._post_connect_task, self._missed_message_backfill_task):
             if task and not task.done():
                 task.cancel()
