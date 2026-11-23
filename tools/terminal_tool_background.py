@@ -149,6 +149,16 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     process_registry.pending_watchers.append(watcher)
 
 
+
+def promote_watch_completion(registry, session) -> None:
+    """Retain completion delivery when a watch-pattern breaker disables matches."""
+    session.notify_on_complete = True
+    # Gateway drains leave completions to a per-process watcher. Watch-only
+    # launches already carry routing metadata but have no exit watcher.
+    if session.watcher_platform and not session.watcher_interval:
+        _register_completion_watcher(registry, session, session.session_key)
+
+
 def spawn_background_process(
     *, command: str, env: Any, env_type: str, effective_task_id: str, task_id: Optional[str],
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,

@@ -443,3 +443,48 @@ class TestOverflowNotificationFormatting:
         out = format_process_notification(evt)
         assert "notifications resumed" in out
         assert "exit code" not in out
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("breaker", ["strikes", "lifetime"])
+@pytest.mark.parametrize("platform,interval", [("telegram", 0), ("telegram", 5), ("", 0)])
+def test_watch_fallback_preserves_completion_delivery(registry, monkeypatch, breaker, platform, interval, live):
+    """A watch-only gateway process must acquire its missing exit watcher (#159358)."""
+    import sys
+    from types import SimpleNamespace
+    from tools.process_registry import WATCH_LIFETIME_MAX_HITS, WATCH_STRIKE_LIMIT
+
+    # Use the real registration path without a serving gateway: its descriptor must
+    # remain queued for the post-turn drain, just like a notify=true launch.
+    armed = []
+    runner = SimpleNamespace(arm_process_watcher=lambda w: armed.append(w) or True)
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(
+        _gateway_runner_ref=(lambda: runner) if live else None))
+    session = _make_session(watch_patterns=["Application started"])
+    session.session_key = "agent:main:telegram:dm:123"
+    session.watcher_platform = platform
+    session.watcher_chat_id = "123"
+    session.watcher_interval = interval
+    if breaker == "lifetime":
+        session._watch_hits = WATCH_LIFETIME_MAX_HITS - 1
+    else:
+        session._watch_cooldown_until = time.time() + 60
+        session._watch_consecutive_strikes = WATCH_STRIKE_LIMIT - 1
+
+    registry._check_watch_patterns(session, "Application started\n")
+
+    assert session._watch_disabled and session.notify_on_complete
+    if platform and not interval:
+        assert session.watcher_interval == 5
+        watchers = armed if live else registry.pending_watchers
+        assert len(watchers) == 1
+        assert not (registry.pending_watchers if live else armed)
+        watcher = watchers[0]
+        assert watcher["session_id"] == session.id
+        assert watcher["session_key"] == session.session_key
+        assert watcher["chat_id"] == "123"
+        assert watcher["notify_on_complete"] is True
+        registry._check_watch_patterns(session, "Application started\n")
+        assert len(watchers) == 1
+    else:
+        assert registry.pending_watchers == [] and armed == []
